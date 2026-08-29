@@ -1,0 +1,123 @@
+name: Build APK
+
+# Chạy khi push code lên nhánh main, hoặc bấm chạy tay từ tab Actions trên GitHub.
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Nếu repo có sẵn 1 file .zip (bạn chỉ cần up đúng file zip project lên
+      # repo, không cần tự giải nén thủ công) -> tự tìm và giải nén ra, lấy
+      # đúng thư mục chứa pubspec.yaml (dù zip có bọc 1 lớp thư mục con hay
+      # không) rồi copy đè ra thư mục gốc của repo để build tiếp.
+      - name: Tự tìm và giải nén file .zip (nếu có)
+        run: |
+          ZIP_FILE=$(find . -maxdepth 1 -iname "*.zip" | head -n1)
+          if [ -n "$ZIP_FILE" ]; then
+            echo "Tìm thấy zip: $ZIP_FILE -> đang giải nén..."
+            rm -rf /tmp/extracted && mkdir -p /tmp/extracted
+            unzip -o "$ZIP_FILE" -d /tmp/extracted > /dev/null
+            PUBSPEC_PATH=$(find /tmp/extracted -maxdepth 4 -name "pubspec.yaml" | head -n1)
+            if [ -z "$PUBSPEC_PATH" ]; then
+              echo "LỖI: không tìm thấy pubspec.yaml trong file zip."
+              exit 1
+            fi
+            PROJECT_DIR=$(dirname "$PUBSPEC_PATH")
+            echo "Project nằm ở: $PROJECT_DIR -> copy ra thư mục gốc repo"
+            cp -r "$PROJECT_DIR"/. .
+          else
+            echo "Không có file .zip nào ở gốc repo, dùng code hiện có trong repo."
+          fi
+
+      - name: Setup Java (cần cho Android build)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.0'
+          channel: 'stable'
+          cache: true
+
+      # Project này chỉ chứa code Dart (lib/, pubspec.yaml). Nếu chưa có
+      # khung Android (android/ folder với Gradle, AndroidManifest...),
+      # tự tạo ngay tại đây bằng chính Flutter SDK - không cần bạn làm gì
+      # thủ công trước. Backup pubspec.yaml + lib/ trước, restore lại sau
+      # để đảm bảo chắc chắn không bị "flutter create" ghi đè code đã có.
+      - name: Tạo khung Android (nếu chưa có)
+        run: |
+          if [ ! -d "android" ]; then
+            cp pubspec.yaml /tmp/pubspec.yaml.bak
+            cp -r lib /tmp/lib.bak
+            flutter create --platforms=android --org vn.lotto535 --project-name chiagiai_watcher .
+            cp /tmp/pubspec.yaml.bak pubspec.yaml
+            rm -rf lib
+            cp -r /tmp/lib.bak lib
+          else
+            echo "android/ đã tồn tại, bỏ qua."
+          fi
+
+      # Ghim đúng version Gradle/AGP/Kotlin đã biết chạy ổn định.
+      - name: Ghim version Gradle/AGP/Kotlin (AGP 8.3.0, Kotlin 1.9.24, Gradle 8.6)
+        run: |
+          SETTINGS="android/settings.gradle"
+          WRAPPER="android/gradle/wrapper/gradle-wrapper.properties"
+
+          sed -i 's/id "com.android.application" version "[^"]*"/id "com.android.application" version "8.3.0"/' "$SETTINGS"
+          sed -i 's/id "org.jetbrains.kotlin.android" version "[^"]*"/id "org.jetbrains.kotlin.android" version "1.9.24"/' "$SETTINGS"
+          sed -i 's#distributionUrl=.*#distributionUrl=https\\://services.gradle.org/distributions/gradle-8.6-all.zip#' "$WRAPPER"
+
+          echo "--- settings.gradle ---"
+          cat "$SETTINGS"
+          echo "--- gradle-wrapper.properties ---"
+          cat "$WRAPPER"
+
+      # Thêm quyền Internet + thông báo (Android 13+) vào AndroidManifest.
+      - name: Thêm quyền Internet + thông báo vào AndroidManifest
+        run: |
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          if ! grep -q "android.permission.INTERNET" "$MANIFEST"; then
+            sed -i 's#<manifest xmlns:android="http://schemas.android.com/apk/res/android">#<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n    <uses-permission android:name="android.permission.INTERNET" />#' "$MANIFEST"
+          fi
+          if ! grep -q "android.permission.POST_NOTIFICATIONS" "$MANIFEST"; then
+            sed -i 's#<manifest xmlns:android="http://schemas.android.com/apk/res/android">#<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />#' "$MANIFEST"
+          fi
+          cat "$MANIFEST"
+
+      - name: Cài dependencies
+        run: flutter pub get
+
+      - name: Tạo app icon (flutter_launcher_icons)
+        run: dart run flutter_launcher_icons
+
+      - name: Build APK (release)
+        run: flutter build apk --release
+
+      # Upload APK làm artifact của lần chạy này -> tải về từ tab Actions,
+      # không cần cấu hình gì thêm.
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chiagiai-watcher-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 30
+
+      # Nếu commit này có gắn tag (vd git tag v1.0.0 && git push --tags),
+      # tự động tạo 1 GitHub Release và đính kèm APK vào đó luôn.
+      - name: Tạo Release (chỉ khi có tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/app/outputs/flutter-apk/app-release.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
